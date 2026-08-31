@@ -1,8 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { nanoid } from "nanoid";
-import { serverDataJsonPath } from "@/lib/server-data-paths";
 import { isFeatureEnabled } from "@/lib/feature-flags";
+import { getDb } from "@/lib/sqlite-db";
 
 export type SignalPollOption = {
   id: string;
@@ -36,6 +34,7 @@ export type Signal = {
   taken_down?: boolean;
   takedown_reason?: string;
   taken_down_at?: number;
+  media?: MediaAttachment[];
 };
 
 export type SignalReply = {
@@ -47,26 +46,99 @@ export type SignalReply = {
   upvotes: string[];
   created_at: number;
   signature: string;
+  media?: MediaAttachment[];
 };
 
-type SignalsStore = Record<string, Signal>;
-type SignalRepliesStore = Record<string, SignalReply>;
+// Issue #36: signals & signal_replies are now backed by SQLite (indexed on
+// channel+created_at, status, author_wallet, and signal_id) instead of
+// parsing the full signals.json / signal-replies.json array on every call.
 
-async function readJsonStore<T extends object>(filePath: string): Promise<T> {
-  try {
-    const raw = await readFile(filePath, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return {} as T;
-  }
+type SignalRow = {
+  id: string;
+  author_wallet: string;
+  author_display: string;
+  channel: string;
+  title: string;
+  body: string;
+  nft_token_id: number | null;
+  nft_collection_id: number | null;
+  nft_name: string | null;
+  nft_image: string | null;
+  upvotes_json: string;
+  created_at: number;
+  signature: string;
+  type: string | null;
+  poll_json: string | null;
+  scheduled_for: number | null;
+  status: string | null;
+  taken_down: number;
+  takedown_reason: string | null;
+  taken_down_at: number | null;
+  media_json: string | null;
+};
+
+type ReplyRow = {
+  id: string;
+  signal_id: string;
+  author_wallet: string;
+  author_display: string;
+  body: string;
+  upvotes_json: string;
+  created_at: number;
+  signature: string;
+  media_json: string | null;
+};
+
+function rowToSignal(row: SignalRow): Signal {
+  return {
+    id: row.id,
+    author_wallet: row.author_wallet,
+    author_display: row.author_display,
+    channel: row.channel,
+    title: row.title,
+    body: row.body,
+    nft_token_id: row.nft_token_id ?? undefined,
+    nft_collection_id: row.nft_collection_id ?? undefined,
+    nft_name: row.nft_name ?? undefined,
+    nft_image: row.nft_image ?? undefined,
+    upvotes: JSON.parse(row.upvotes_json) as string[],
+    created_at: row.created_at,
+    signature: row.signature,
+    type: (row.type as Signal["type"]) ?? undefined,
+    poll: row.poll_json
+      ? (JSON.parse(row.poll_json) as SignalPoll)
+      : undefined,
+    scheduled_for: row.scheduled_for ?? undefined,
+    status: (row.status as Signal["status"]) ?? undefined,
+    taken_down: row.taken_down === 1 ? true : undefined,
+    takedown_reason: row.takedown_reason ?? undefined,
+    taken_down_at: row.taken_down_at ?? undefined,
+    media: row.media_json
+      ? (JSON.parse(row.media_json) as MediaAttachment[])
+      : undefined,
+  };
 }
 
-async function writeJsonStore<T extends object>(
-  filePath: string,
-  data: T,
-): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
+function rowToReply(row: ReplyRow): SignalReply {
+  return {
+    id: row.id,
+    signal_id: row.signal_id,
+    author_wallet: row.author_wallet,
+    author_display: row.author_display,
+    body: row.body,
+    upvotes: JSON.parse(row.upvotes_json) as string[],
+    created_at: row.created_at,
+    signature: row.signature,
+    media: row.media_json
+      ? (JSON.parse(row.media_json) as MediaAttachment[])
+      : undefined,
+  };
+}
+
+function getSignalRow(id: string): SignalRow | undefined {
+  return getDb().prepare("SELECT * FROM signals WHERE id = ?").get(id) as
+    | SignalRow
+    | undefined;
 }
 
 /** hot = upvotes + recency weighted (upvotes * 3 + created_at/1000) */
@@ -78,22 +150,26 @@ export async function getSignals(
   channel?: string,
   sort: "hot" | "new" | "top" = "hot",
 ): Promise<Signal[]> {
-  const store = await readJsonStore<SignalsStore>(
-    serverDataJsonPath("signals"),
-  );
-  let items = Object.values(store);
   const now = Date.now();
-  items = items.filter(
-    (signal) =>
-      signal.status !== "cancelled" &&
-      (!signal.scheduled_for || signal.scheduled_for <= now),
-  );
+  const conditions: string[] = [
+    "status != 'cancelled'",
+    "(scheduled_for IS NULL OR scheduled_for <= ?)",
+  ];
+  const params: unknown[] = [now];
+
   if (isModerationEnabled()) {
-    items = items.filter((s) => !s.taken_down);
+    conditions.push("taken_down = 0");
   }
   if (channel && channel !== "all") {
-    items = items.filter((s) => s.channel === channel);
+    conditions.push("channel = ?");
+    params.push(channel);
   }
+
+  const rows = getDb()
+    .prepare(`SELECT * FROM signals WHERE ${conditions.join(" AND ")}`)
+    .all(...params) as SignalRow[];
+
+  let items = rows.map(rowToSignal);
   if (sort === "new") {
     items.sort((a, b) => b.created_at - a.created_at);
   } else if (sort === "top") {
@@ -105,17 +181,13 @@ export async function getSignals(
 }
 
 export async function getSignal(id: string): Promise<Signal | null> {
-  const store = await readJsonStore<SignalsStore>(
-    serverDataJsonPath("signals"),
-  );
-  return store[id] ?? null;
+  const row = getSignalRow(id);
+  return row ? rowToSignal(row) : null;
 }
 
 export async function createSignal(
   data: Omit<Signal, "id" | "created_at">,
 ): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
   const now = Date.now();
   const scheduled =
     isFeatureEnabled("phase-89") &&
@@ -129,42 +201,72 @@ export async function createSignal(
       ? { status: "scheduled" as const }
       : { status: "published" as const }),
   };
-  store[signal.id] = signal;
-  await writeJsonStore(filePath, store);
+
+  getDb()
+    .prepare(
+      `INSERT INTO signals
+         (id, author_wallet, author_display, channel, title, body,
+          nft_token_id, nft_collection_id, nft_name, nft_image,
+          upvotes_json, upvote_count, created_at, signature, type,
+          poll_json, scheduled_for, status, taken_down, takedown_reason,
+          taken_down_at, media_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      signal.id,
+      signal.author_wallet,
+      signal.author_display,
+      signal.channel,
+      signal.title,
+      signal.body,
+      signal.nft_token_id ?? null,
+      signal.nft_collection_id ?? null,
+      signal.nft_name ?? null,
+      signal.nft_image ?? null,
+      JSON.stringify(signal.upvotes ?? []),
+      (signal.upvotes ?? []).length,
+      signal.created_at,
+      signal.signature,
+      signal.type ?? null,
+      signal.poll ? JSON.stringify(signal.poll) : null,
+      signal.scheduled_for ?? null,
+      signal.status ?? null,
+      signal.taken_down ? 1 : 0,
+      signal.takedown_reason ?? null,
+      signal.taken_down_at ?? null,
+      signal.media ? JSON.stringify(signal.media) : null,
+    );
+
   return signal;
 }
 
 export async function getScheduledSignals(wallet: string): Promise<Signal[]> {
   if (!isFeatureEnabled("phase-89")) return [];
-  const store = await readJsonStore<SignalsStore>(
-    serverDataJsonPath("signals"),
-  );
   const now = Date.now();
-  return Object.values(store)
-    .filter(
-      (signal) =>
-        signal.author_wallet === wallet &&
-        signal.status === "scheduled" &&
-        (signal.scheduled_for ?? 0) > now,
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM signals
+       WHERE author_wallet = ? AND status = 'scheduled' AND scheduled_for > ?
+       ORDER BY scheduled_for ASC`,
     )
-    .sort((a, b) => (a.scheduled_for ?? 0) - (b.scheduled_for ?? 0));
+    .all(wallet, now) as SignalRow[];
+  return rows.map(rowToSignal);
 }
 
 export async function cancelScheduledSignal(
   id: string,
   wallet: string,
 ): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
-  const signal = store[id];
-  if (!signal) throw new Error("Signal not found");
-  if (signal.author_wallet !== wallet) throw new Error("Not signal owner");
-  if (signal.status !== "scheduled") throw new Error("Signal is not scheduled");
-  if ((signal.scheduled_for ?? 0) <= Date.now())
+  const row = getSignalRow(id);
+  if (!row) throw new Error("Signal not found");
+  if (row.author_wallet !== wallet) throw new Error("Not signal owner");
+  if (row.status !== "scheduled") throw new Error("Signal is not scheduled");
+  if ((row.scheduled_for ?? 0) <= Date.now())
     throw new Error("Signal has already published");
-  signal.status = "cancelled";
-  await writeJsonStore(filePath, store);
-  return signal;
+  getDb()
+    .prepare("UPDATE signals SET status = 'cancelled' WHERE id = ?")
+    .run(id);
+  return rowToSignal({ ...row, status: "cancelled" });
 }
 
 export async function voteOnPoll(
@@ -172,76 +274,98 @@ export async function voteOnPoll(
   optionId: string,
   wallet: string,
 ): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
-  const signal = store[signalId];
-  if (!signal || signal.type !== "poll" || !signal.poll)
+  const row = getSignalRow(signalId);
+  if (!row || row.type !== "poll" || !row.poll_json)
     throw new Error("Poll not found");
-  if (signal.poll.closes_at && signal.poll.closes_at <= Date.now())
+  const poll = JSON.parse(row.poll_json) as SignalPoll;
+  if (poll.closes_at && poll.closes_at <= Date.now())
     throw new Error("Poll is closed");
-  const selected = signal.poll.options.find((option) => option.id === optionId);
+  const selected = poll.options.find((option) => option.id === optionId);
   if (!selected) throw new Error("Poll option not found");
-  for (const option of signal.poll.options) {
+  for (const option of poll.options) {
     option.voters = option.voters.filter((voter) => voter !== wallet);
   }
   selected.voters.push(wallet);
-  await writeJsonStore(filePath, store);
-  return signal;
+
+  getDb()
+    .prepare("UPDATE signals SET poll_json = ? WHERE id = ?")
+    .run(JSON.stringify(poll), signalId);
+  return rowToSignal({ ...row, poll_json: JSON.stringify(poll) });
 }
 
 export async function upvoteSignal(
   id: string,
   wallet: string,
 ): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
-  const signal = store[id];
-  if (!signal) throw new Error("Signal not found");
-  const idx = signal.upvotes.indexOf(wallet);
+  const row = getSignalRow(id);
+  if (!row) throw new Error("Signal not found");
+  const upvotes = JSON.parse(row.upvotes_json) as string[];
+  const idx = upvotes.indexOf(wallet);
   if (idx === -1) {
-    signal.upvotes.push(wallet);
+    upvotes.push(wallet);
   } else {
-    signal.upvotes.splice(idx, 1);
+    upvotes.splice(idx, 1);
   }
-  await writeJsonStore(filePath, store);
-  return signal;
+  const upvotesJson = JSON.stringify(upvotes);
+  getDb()
+    .prepare(
+      "UPDATE signals SET upvotes_json = ?, upvote_count = ? WHERE id = ?",
+    )
+    .run(upvotesJson, upvotes.length, id);
+  return rowToSignal({ ...row, upvotes_json: upvotesJson });
 }
 
 export async function getReplies(signal_id: string): Promise<SignalReply[]> {
-  const store = await readJsonStore<SignalRepliesStore>(
-    serverDataJsonPath("signalReplies"),
-  );
-  return Object.values(store)
-    .filter((r) => r.signal_id === signal_id)
-    .sort((a, b) => a.created_at - b.created_at);
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM signal_replies WHERE signal_id = ? ORDER BY created_at ASC",
+    )
+    .all(signal_id) as ReplyRow[];
+  return rows.map(rowToReply);
 }
 
 export async function createReply(
   data: Omit<SignalReply, "id" | "created_at">,
 ): Promise<SignalReply> {
-  const filePath = serverDataJsonPath("signalReplies");
-  const store = await readJsonStore<SignalRepliesStore>(filePath);
   const reply: SignalReply = {
     ...data,
     id: nanoid(10),
     created_at: Date.now(),
   };
-  store[reply.id] = reply;
-  await writeJsonStore(filePath, store);
+  getDb()
+    .prepare(
+      `INSERT INTO signal_replies
+         (id, signal_id, author_wallet, author_display, body,
+          upvotes_json, created_at, signature, media_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      reply.id,
+      reply.signal_id,
+      reply.author_wallet,
+      reply.author_display,
+      reply.body,
+      JSON.stringify(reply.upvotes ?? []),
+      reply.created_at,
+      reply.signature,
+      reply.media ? JSON.stringify(reply.media) : null,
+    );
   return reply;
 }
 
 export async function getSignalChannelStats(
   worldNames: Record<string, string>,
 ): Promise<Array<{ id: string; label: string; count: number }>> {
-  const store = await readJsonStore<SignalsStore>(
-    serverDataJsonPath("signals"),
-  );
+  const db = getDb();
+  const countRows = db
+    .prepare("SELECT channel, COUNT(*) as n FROM signals GROUP BY channel")
+    .all() as Array<{ channel: string; n: number }>;
   const counts: Record<string, number> = {};
-  for (const s of Object.values(store)) {
-    counts[s.channel] = (counts[s.channel] ?? 0) + 1;
+  let total = 0;
+  for (const { channel, n } of countRows) {
+    counts[channel] = n;
+    total += n;
   }
-  const total = Object.values(store).length;
 
   const channels: Array<{ id: string; label: string; count: number }> = [
     { id: "all", label: "All signals", count: total },
@@ -276,28 +400,37 @@ export async function takedownSignal(
   id: string,
   reason: string,
 ): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
-  const signal = store[id];
-  if (!signal) throw new Error("Signal not found");
-  signal.taken_down = true;
-  signal.takedown_reason = reason;
-  signal.taken_down_at = Date.now();
-  await writeJsonStore(filePath, store);
-  return signal;
+  const row = getSignalRow(id);
+  if (!row) throw new Error("Signal not found");
+  const taken_down_at = Date.now();
+  getDb()
+    .prepare(
+      "UPDATE signals SET taken_down = 1, takedown_reason = ?, taken_down_at = ? WHERE id = ?",
+    )
+    .run(reason, taken_down_at, id);
+  return rowToSignal({
+    ...row,
+    taken_down: 1,
+    takedown_reason: reason,
+    taken_down_at,
+  });
 }
 
 /** Reinstates a previously taken-down signal (rollback path). */
 export async function restoreSignal(id: string): Promise<Signal> {
-  const filePath = serverDataJsonPath("signals");
-  const store = await readJsonStore<SignalsStore>(filePath);
-  const signal = store[id];
-  if (!signal) throw new Error("Signal not found");
-  signal.taken_down = false;
-  signal.takedown_reason = undefined;
-  signal.taken_down_at = undefined;
-  await writeJsonStore(filePath, store);
-  return signal;
+  const row = getSignalRow(id);
+  if (!row) throw new Error("Signal not found");
+  getDb()
+    .prepare(
+      "UPDATE signals SET taken_down = 0, takedown_reason = NULL, taken_down_at = NULL WHERE id = ?",
+    )
+    .run(id);
+  return rowToSignal({
+    ...row,
+    taken_down: 0,
+    takedown_reason: null,
+    taken_down_at: null,
+  });
 }
 
 // ─── phase-116: narrative contributor attribution & credit ledger ───────────
@@ -429,19 +562,19 @@ export async function addMediaToSignal(
   media: MediaAttachment,
 ): Promise<Signal> {
   if (!isPhase86Enabled()) throw new Error("phase-86 disabled");
-  const store = await readJsonStore<SignalsStore>(
-    serverDataJsonPath("signals"),
-  );
-  const signal = store[signalId];
-  if (!signal) throw new Error("Signal not found");
+  const row = getSignalRow(signalId);
+  if (!row) throw new Error("Signal not found");
 
-  if (!signal.media) {
-    signal.media = [];
-  }
-  signal.media.push(media);
+  const mediaList: MediaAttachment[] = row.media_json
+    ? (JSON.parse(row.media_json) as MediaAttachment[])
+    : [];
+  mediaList.push(media);
+  const mediaJson = JSON.stringify(mediaList);
 
-  await writeJsonStore(serverDataJsonPath("signals"), store);
-  return signal;
+  getDb()
+    .prepare("UPDATE signals SET media_json = ? WHERE id = ?")
+    .run(mediaJson, signalId);
+  return rowToSignal({ ...row, media_json: mediaJson });
 }
 
 export async function addMediaToReply(
@@ -449,19 +582,23 @@ export async function addMediaToReply(
   media: MediaAttachment,
 ): Promise<SignalReply> {
   if (!isPhase86Enabled()) throw new Error("phase-86 disabled");
-  const store = await readJsonStore<SignalRepliesStore>(
-    serverDataJsonPath("signalReplies"),
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM signal_replies WHERE id = ?")
+    .get(replyId) as ReplyRow | undefined;
+  if (!row) throw new Error("Reply not found");
+
+  const mediaList: MediaAttachment[] = row.media_json
+    ? (JSON.parse(row.media_json) as MediaAttachment[])
+    : [];
+  mediaList.push(media);
+  const mediaJson = JSON.stringify(mediaList);
+
+  db.prepare("UPDATE signal_replies SET media_json = ? WHERE id = ?").run(
+    mediaJson,
+    replyId,
   );
-  const reply = store[replyId];
-  if (!reply) throw new Error("Reply not found");
-
-  if (!reply.media) {
-    reply.media = [];
-  }
-  reply.media.push(media);
-
-  await writeJsonStore(serverDataJsonPath("signalReplies"), store);
-  return reply;
+  return rowToReply({ ...row, media_json: mediaJson });
 }
 
 export async function generateThumbnail(
