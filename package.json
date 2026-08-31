@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "next build",
-    "dev": "NODE_OPTIONS=--no-deprecation next dev",
+    "build": "node api.js && next build",
+    "dev": "node api.js && NODE_OPTIONS=--no-deprecation next dev",
     "interact": "next dev",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
@@ -16,9 +16,10 @@
     "reset:phase": "cd scripts && npm run reset:phase",
     "deploy:phase-sep50": "cd scripts && npx tsx deploy-phase-sep50.ts",
     "seed:phaser-prueba": "cd scripts && npx tsx seed-phaser-prueba.ts",
-    "start": "next start",
+    "start": "node api.js && next start",
     "security:audit": "npm audit --audit-level=high",
-    "security:secret-rotation": "tsx scripts/check-secret-rotation.ts"
+    "security:secret-rotation": "tsx scripts/check-secret-rotation.ts",
+    "migrate:sqlite": "tsx scripts/migrate-json-to-sqlite.ts"
   },
   "dependencies": {
     "@albedo-link/intent": "0.12.0",
