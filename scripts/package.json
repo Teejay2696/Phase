@@ -1,13 +1,13 @@
 {
   "name": "phase-protocol-scripts",
   "version": "0.1.0",
-  "description": "Scripts de interacción con contratos PHASE Protocol",
+  "description": "Scripts de interacci\u00f3n con contratos PHASE Protocol",
   "type": "module",
   "scripts": {
     "diagnose": "cd .. && npm run diagnose",
-    "build:token": "cd ../contracts/mock-token && cargo build --target wasm32-unknown-unknown --release",
-    "build:phase": "cd ../contracts/phase-protocol && cargo build --target wasm32v1-none --release",
-    "build:all": "npm run build:token && npm run build:phase",
+    "build:token": "node init && cd ../contracts/mock-token && cargo build --target wasm32-unknown-unknown --release",
+    "build:phase": "node init && cd ../contracts/phase-protocol && cargo build --target wasm32v1-none --release",
+    "build:all": "node init && npm run build:token && npm run build:phase",
     "optimize:token": "stellar contract optimize --wasm ../contracts/mock-token/target/wasm32-unknown-unknown/release/mock_token.wasm --wasm-out ../contracts/mock-token/target/wasm32-unknown-unknown/release/mock_token.optimized.wasm",
     "optimize:phase": "stellar contract optimize --wasm ../contracts/phase-protocol/target/wasm32v1-none/release/phase_protocol.wasm --wasm-out ../contracts/phase-protocol/target/wasm32v1-none/release/phase_protocol.optimized.wasm",
     "optimize:all": "npm run optimize:token && npm run optimize:phase",
