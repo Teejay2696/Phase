@@ -5,6 +5,7 @@ import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { isFeatureEnabled, flagRollbackNote } from "@/lib/feature-flags";
 import { serverDataJsonPath } from "@/lib/server-data-paths";
+import { getDb } from "@/lib/sqlite-db";
 
 export type ListingStatus = "active" | "sold" | "cancelled";
 export type OfferStatus = "pending" | "accepted" | "rejected" | "expired";
@@ -34,8 +35,6 @@ export type Offer = {
   expires_at: number;
 };
 
-type ListingsStore = Record<string, Listing>;
-type OffersStore = Record<string, Offer>;
 type ProfileViewAnalyticsStore = Record<string, CreatorProfileViewAnalytics>;
 
 const OFFER_TTL_MS = 48 * 60 * 60 * 1000; // 48h
@@ -187,12 +186,45 @@ export async function getCreatorProfileViewAnalytics(
 }
 
 // ── Listings ──────────────────────────────────────────────────────────────────
+// Issue #36: backed by SQLite (indexed on status/listed_at, collection_id,
+// seller_wallet) instead of parsing the full market-listings.json array on
+// every call.
+
+type ListingRow = {
+  id: string;
+  token_id: number;
+  collection_id: number;
+  seller_wallet: string;
+  price_phaselq: number;
+  accepts_offers: number;
+  min_offer: number | null;
+  image: string | null;
+  name: string | null;
+  listed_at: number;
+  status: ListingStatus;
+};
+
+function rowToListing(row: ListingRow): Listing {
+  return {
+    id: row.id,
+    token_id: row.token_id,
+    collection_id: row.collection_id,
+    seller_wallet: row.seller_wallet,
+    price_phaselq: row.price_phaselq,
+    accepts_offers: row.accepts_offers === 1,
+    min_offer: row.min_offer ?? undefined,
+    image: row.image ?? undefined,
+    name: row.name ?? undefined,
+    listed_at: row.listed_at,
+    status: row.status,
+  };
+}
 
 export async function getListing(id: string): Promise<Listing | null> {
-  const store = await readJson<ListingsStore>(
-    serverDataJsonPath("marketListings"),
-  );
-  return store[id] ?? null;
+  const row = getDb()
+    .prepare("SELECT * FROM listings WHERE id = ?")
+    .get(id) as ListingRow | undefined;
+  return row ? rowToListing(row) : null;
 }
 
 export type ListingFilters = {
@@ -205,87 +237,139 @@ export type ListingFilters = {
 export async function getListings(
   filters?: ListingFilters,
 ): Promise<Listing[]> {
-  const store = await readJson<ListingsStore>(
-    serverDataJsonPath("marketListings"),
-  );
-  let list = Object.values(store);
-
   const status = filters?.status ?? "active";
-  list = list.filter((l) => l.status === status);
-  if (filters?.collection_id !== undefined)
-    list = list.filter((l) => l.collection_id === filters.collection_id);
-  if (filters?.seller_wallet)
-    list = list.filter((l) => l.seller_wallet === filters.seller_wallet);
+  const conditions: string[] = ["status = ?"];
+  const params: unknown[] = [status];
+
+  if (filters?.collection_id !== undefined) {
+    conditions.push("collection_id = ?");
+    params.push(filters.collection_id);
+  }
+  if (filters?.seller_wallet) {
+    conditions.push("seller_wallet = ?");
+    params.push(filters.seller_wallet);
+  }
 
   const sort = filters?.sort ?? "newest";
-  if (sort === "price_asc")
-    list.sort((a, b) => a.price_phaselq - b.price_phaselq);
-  else if (sort === "price_desc")
-    list.sort((a, b) => b.price_phaselq - a.price_phaselq);
-  else list.sort((a, b) => b.listed_at - a.listed_at);
+  const orderBy =
+    sort === "price_asc"
+      ? "price_phaselq ASC"
+      : sort === "price_desc"
+        ? "price_phaselq DESC"
+        : "listed_at DESC";
 
-  return list;
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM listings WHERE ${conditions.join(" AND ")} ORDER BY ${orderBy}`,
+    )
+    .all(...params) as ListingRow[];
+
+  return rows.map(rowToListing);
 }
 
 export async function createListing(
   data: Omit<Listing, "id" | "listed_at" | "status">,
 ): Promise<Listing> {
-  const store = await readJson<ListingsStore>(
-    serverDataJsonPath("marketListings"),
-  );
   const listing: Listing = {
     ...data,
     id: randomUUID(),
     listed_at: Date.now(),
     status: "active",
   };
-  store[listing.id] = listing;
-  await writeJson(serverDataJsonPath("marketListings"), store);
+  getDb()
+    .prepare(
+      `INSERT INTO listings
+         (id, token_id, collection_id, seller_wallet, price_phaselq,
+          accepts_offers, min_offer, image, name, listed_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      listing.id,
+      listing.token_id,
+      listing.collection_id,
+      listing.seller_wallet,
+      listing.price_phaselq,
+      listing.accepts_offers ? 1 : 0,
+      listing.min_offer ?? null,
+      listing.image ?? null,
+      listing.name ?? null,
+      listing.listed_at,
+      listing.status,
+    );
   return listing;
 }
 
+async function setListingStatus(
+  id: string,
+  status: ListingStatus,
+): Promise<Listing | null> {
+  const db = getDb();
+  const result = db
+    .prepare("UPDATE listings SET status = ? WHERE id = ?")
+    .run(status, id);
+  if (result.changes === 0) return null;
+  const row = db
+    .prepare("SELECT * FROM listings WHERE id = ?")
+    .get(id) as ListingRow;
+  return rowToListing(row);
+}
+
 export async function cancelListing(id: string): Promise<Listing | null> {
-  const store = await readJson<ListingsStore>(
-    serverDataJsonPath("marketListings"),
-  );
-  const listing = store[id];
-  if (!listing) return null;
-  store[id] = { ...listing, status: "cancelled" };
-  await writeJson(serverDataJsonPath("marketListings"), store);
-  return store[id]!;
+  return setListingStatus(id, "cancelled");
 }
 
 export async function soldListing(id: string): Promise<Listing | null> {
-  const store = await readJson<ListingsStore>(
-    serverDataJsonPath("marketListings"),
-  );
-  const listing = store[id];
-  if (!listing) return null;
-  store[id] = { ...listing, status: "sold" };
-  await writeJson(serverDataJsonPath("marketListings"), store);
-  return store[id]!;
+  return setListingStatus(id, "sold");
 }
 
 // ── Offers ────────────────────────────────────────────────────────────────────
+// Issue #36: backed by SQLite (indexed on listing_id, buyer_wallet, and
+// status+expires_at for expiration scans) instead of a full-array scan.
+// Expiration remains computed lazily on read (matching prior behavior): a
+// "pending" offer past `expires_at` is reported as "expired" to callers
+// without a write, so no cron/job is required for the common read path.
+
+type OfferRow = {
+  id: string;
+  listing_id: string;
+  buyer_wallet: string;
+  amount_phaselq: number;
+  message: string | null;
+  created_at: number;
+  status: OfferStatus;
+  expires_at: number;
+};
+
+function rowToOffer(row: OfferRow, now: number): Offer {
+  const offer: Offer = {
+    id: row.id,
+    listing_id: row.listing_id,
+    buyer_wallet: row.buyer_wallet,
+    amount_phaselq: row.amount_phaselq,
+    message: row.message ?? undefined,
+    created_at: row.created_at,
+    status: row.status,
+    expires_at: row.expires_at,
+  };
+  if (offer.status === "pending" && offer.expires_at < now) {
+    return { ...offer, status: "expired" };
+  }
+  return offer;
+}
 
 export async function getOffers(listing_id: string): Promise<Offer[]> {
-  const store = await readJson<OffersStore>(serverDataJsonPath("marketOffers"));
   const now = Date.now();
-  return Object.values(store)
-    .filter((o) => o.listing_id === listing_id)
-    .map((o) => {
-      if (o.status === "pending" && o.expires_at < now) {
-        return { ...o, status: "expired" as OfferStatus };
-      }
-      return o;
-    })
-    .sort((a, b) => b.created_at - a.created_at);
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM offers WHERE listing_id = ? ORDER BY created_at DESC",
+    )
+    .all(listing_id) as OfferRow[];
+  return rows.map((row) => rowToOffer(row, now));
 }
 
 export async function createOffer(
   data: Omit<Offer, "id" | "created_at" | "status" | "expires_at">,
 ): Promise<Offer> {
-  const store = await readJson<OffersStore>(serverDataJsonPath("marketOffers"));
   const offer: Offer = {
     ...data,
     id: randomUUID(),
@@ -293,8 +377,23 @@ export async function createOffer(
     status: "pending",
     expires_at: Date.now() + OFFER_TTL_MS,
   };
-  store[offer.id] = offer;
-  await writeJson(serverDataJsonPath("marketOffers"), store);
+  getDb()
+    .prepare(
+      `INSERT INTO offers
+         (id, listing_id, buyer_wallet, amount_phaselq, message,
+          created_at, status, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      offer.id,
+      offer.listing_id,
+      offer.buyer_wallet,
+      offer.amount_phaselq,
+      offer.message ?? null,
+      offer.created_at,
+      offer.status,
+      offer.expires_at,
+    );
   return offer;
 }
 
@@ -302,25 +401,25 @@ export async function updateOfferStatus(
   offer_id: string,
   status: OfferStatus,
 ): Promise<Offer | null> {
-  const store = await readJson<OffersStore>(serverDataJsonPath("marketOffers"));
-  const offer = store[offer_id];
-  if (!offer) return null;
-  store[offer_id] = { ...offer, status };
-  await writeJson(serverDataJsonPath("marketOffers"), store);
-  return store[offer_id]!;
+  const db = getDb();
+  const result = db
+    .prepare("UPDATE offers SET status = ? WHERE id = ?")
+    .run(status, offer_id);
+  if (result.changes === 0) return null;
+  const row = db
+    .prepare("SELECT * FROM offers WHERE id = ?")
+    .get(offer_id) as OfferRow;
+  return rowToOffer(row, Date.now());
 }
 
 export async function getOffersByBuyer(buyer_wallet: string): Promise<Offer[]> {
-  const store = await readJson<OffersStore>(serverDataJsonPath("marketOffers"));
   const now = Date.now();
-  return Object.values(store)
-    .filter((o) => o.buyer_wallet === buyer_wallet)
-    .map((o) =>
-      o.status === "pending" && o.expires_at < now
-        ? { ...o, status: "expired" as OfferStatus }
-        : o,
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM offers WHERE buyer_wallet = ? ORDER BY created_at DESC",
     )
-    .sort((a, b) => b.created_at - a.created_at);
+    .all(buyer_wallet) as OfferRow[];
+  return rows.map((row) => rowToOffer(row, now));
 }
 
 // ── Issue #103: Mute and Block Primitives (phase-85) ─────────────────────────
